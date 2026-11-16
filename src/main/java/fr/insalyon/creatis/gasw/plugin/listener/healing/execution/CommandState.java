@@ -37,8 +37,10 @@ import fr.insalyon.creatis.gasw.bean.*;
 import fr.insalyon.creatis.gasw.dao.*;
 import fr.insalyon.creatis.gasw.execution.*;
 import fr.insalyon.creatis.gasw.plugin.listener.healing.HealingConfiguration;
+import fr.insalyon.creatis.gasw.plugin.ExecutorPlugin;
 
 import java.util.*;
+import java.util.stream.IntStream;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -58,11 +60,6 @@ public class CommandState {
 
     private Map<String,Long> lastLoggedTimes;
 
-    // InvocationID -> current resource index
-    private Map<Integer, Integer> invocationResourceIndex;
-    // InvocationID -> retry count on current resource
-    private Map<Integer, Integer> invocationRetryCount;
-
     public CommandState(String command) {
 
         this.command = command;
@@ -76,10 +73,6 @@ public class CommandState {
         this.killAllJobs = false;
 
         this.lastLoggedTimes = new HashMap<>();
-
-        this.invocationResourceIndex = new HashMap<>();
-        this.invocationRetryCount = new HashMap<>();
-
         new ReplicationMonitor().start();
     }
 
@@ -409,7 +402,6 @@ public class CommandState {
                     if ((jobStatus == GaswStatus.ERROR_HELD) || (jobStatus == GaswStatus.STALLED_HELD)) {
                         // Try resource fallback first
                         if (tryResourceFallback(job, invocationID)) {
-                            logger.info("Job {} rescheduled to fallback resource", job.getId());
                             continue;
                         }
 
@@ -446,57 +438,63 @@ public class CommandState {
 
     private boolean tryResourceFallback(Job job, int invocationID) throws DAOException {
         try {
-            List<String> fallbackResources = GaswConfiguration.getInstance().getFallbackResources();
+            List<AbstractMap.SimpleEntry<String, String>> fallbackResources = GaswConfiguration.getInstance().getFallbackResources();
             if (fallbackResources == null || fallbackResources.isEmpty()) {
-                logger.debug("No fallback resources configured");
+                logger.info("No fallback resources configured");
                 return false;
             }
 
-            int currentRetryCount = invocationRetryCount.getOrDefault(invocationID, 0);
-            int threshold = GaswConfiguration.getInstance().getFallbackRetryThreshold();
-            if (currentRetryCount < threshold) {
-                // Increment retry count for current resource
-                invocationRetryCount.put(invocationID, currentRetryCount + 1);
-                logger.debug("Retry count {} for invocation {}, threshold {}", currentRetryCount + 1, invocationID, threshold);
-                return false;
-            }
+            // Derive current resource index from current configPath, -1 means primary executor with default './conf' folder
+            String currentConfigDir = GaswConfiguration.getInstance().getConfigDir();
+            int currentResourceIndex = IntStream.range(0, fallbackResources.size())
+                    .filter(i -> {
+                        String expectedDir = "./conf-" + fallbackResources.get(i).getValue().toLowerCase();
+                        return expectedDir.equalsIgnoreCase(currentConfigDir);
+                    })
+                    .findFirst()
+                    .orElse(-1);
 
-            // Threshold reached, try next resource
-            int currentResourceIndex = invocationResourceIndex.getOrDefault(invocationID, 0);
             if (currentResourceIndex >= fallbackResources.size() - 1) {
-                logger.debug("No more fallback resources available for invocation {}", invocationID);
+                logger.info("No more fallback resources available for invocation {}", invocationID);
                 return false;
             }
 
             // Move to next resource
-            int nextResourceIndex = currentResourceIndex + 1;
-            String nextResourceType = fallbackResources.get(nextResourceIndex);
-            String currentExecutor = job.getExecutor();
+            Map.Entry<String, String> nextResource = fallbackResources.get(currentResourceIndex + 1);
+            String nextResourceType = nextResource.getKey();
             if (nextResourceType == null || nextResourceType.isEmpty()) {
-                logger.warn("Cannot switch to resource - type is missing at index {}", nextResourceIndex);
+                logger.warn("Cannot switch to resource - executor type is missing");
                 return false;
             }
 
-            if (nextResourceType.equals(currentExecutor)) {
-                logger.warn("Cannot switch to resource - same executor as current ({})", currentExecutor);
+            // Get the next resource config path
+            String nextResourceConfigPath = nextResource.getValue();
+            if (nextResourceConfigPath == null || nextResourceConfigPath.isEmpty()) {
+                logger.error("Could not find resource config path for executor {}", nextResourceType);
                 return false;
             }
 
-            // Update job for resubmission
-            JobDAO jobDAO = DAOFactory.getDAOFactory().getJobDAO();
-            job.setExecutor(nextResourceType);
-            job.setStatus(GaswStatus.RESCHEDULE);
-            jobDAO.update(job);
+            ExecutorPlugin currentExecutor = GaswConfiguration.getInstance().getExecutorPlugins()
+                    .stream()
+                    .filter(e -> e.getName().equalsIgnoreCase(job.getExecutor()))
+                    .findFirst()
+                    .orElse(null);
+            if (currentExecutor == null) {
+                logger.error("Could not find executor plugin for {}", job.getExecutor());
+                return false;
+            }
 
-            // Update state tracking
-            invocationResourceIndex.put(invocationID, nextResourceIndex);
-            // Reset retry count for new resource
-            invocationRetryCount.put(invocationID, 0);
-
-            logger.info("Switched job {} from executor {} to {}",
-                    job.getId(), currentExecutor, nextResourceType);
+            GaswInput gaswInput = currentExecutor.getGaswInput();
+            String jobId = gaswInput.getApplicationName().replace(' ', '_') + "-" + System.nanoTime() + ".sh";
+            gaswInput.setJobId(jobId);
+            String nextConfDir = "./conf-" + nextResourceConfigPath.toLowerCase();
+            logger.info("Switched job from executor {} to {}, with config directory {}", currentExecutor.getName().toUpperCase(), nextResourceType, nextConfDir);
+            GaswConfiguration.getInstance().terminate(false);
+            GaswConfiguration.getInstance().reloadGasw(nextConfDir);
+            // Resubmit job with same parameters
+            Gasw.getInstance().submit(gaswInput);
             return true;
-        } catch (DAOException | GaswException ex) {
+        } catch (GaswException ex) {
             logger.error("Error trying resource fallback for job {}: ", job.getId(), ex);
             return false;
         }
